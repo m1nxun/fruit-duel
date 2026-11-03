@@ -2346,10 +2346,37 @@ if(document.fonts && document.fonts.load) {
       document.head.appendChild(s);
     });
   }
+  /* 원거리 대응 — 모델은 입력을 200px 남짓으로 줄여 보므로, 경기장에 쓰는 가운데 영역만
+     잘라 보내면 같은 손이 두 배 넘게 크게 잡힌다. 결과 좌표는 다시 전체 영상 기준으로 되돌린다. */
+  const cropCv = document.createElement('canvas'), cropCtx = cropCv.getContext('2d');
+  let cropBox = { x0:0, w:1, y0:0, h:1 };
+  // One Euro 필터 — 천천히 움직일 땐 떨림을 누르고, 빠르게 휘두를 땐 거의 지연이 없다
+  class OneEuro {
+    constructor(minCut=1.4, beta=0.02, dCut=1.0) { this.minCut=minCut; this.beta=beta; this.dCut=dCut; this.x=null; this.dx=0; this.t=0; }
+    static a(cut, dt) { const r = 2*Math.PI*cut*dt; return r/(r+1); }
+    filter(v, t) {
+      if(this.x === null || t - this.t > 0.3) { this.x = v; this.dx = 0; this.t = t; return v; }
+      const dt = Math.max(1e-3, t - this.t); this.t = t;
+      const d = (v - this.x)/dt;
+      this.dx += OneEuro.a(this.dCut, dt)*(d - this.dx);
+      const cut = this.minCut + this.beta*Math.abs(this.dx)*1000;
+      this.x += OneEuro.a(cut, dt)*(v - this.x);
+      return this.x;
+    }
+  }
+  const fx = new OneEuro(), fy = new OneEuro();
   let lastDetect = 0;
   const detect = async ts => {
     if(!stream) { detecting = false; return; }
-    if(ts - lastDetect > 33) { lastDetect = ts; try { await hands.send({image:video}); } catch(e){} }
+    if(ts - lastDetect > 33 && video.videoWidth) {
+      lastDetect = ts;
+      const b = booth._camBox(video);
+      cropBox = b;
+      const sw = Math.round(b.w*video.videoWidth), sh = Math.round(b.h*video.videoHeight);
+      if(cropCv.width !== sw || cropCv.height !== sh) { cropCv.width = sw; cropCv.height = sh; }
+      cropCtx.drawImage(video, b.x0*video.videoWidth, b.y0*video.videoHeight, sw, sh, 0, 0, sw, sh);
+      try { await hands.send({image:cropCv}); } catch(e){}
+    }
     requestAnimationFrame(detect);
   };
   async function startCamera() {
@@ -2360,13 +2387,15 @@ if(document.fonts && document.fonts.load) {
       if(!hands) {
         if(typeof Hands === 'undefined') await loadScript(HANDS_CDN + 'hands.js');
         hands = new Hands({ locateFile: f => HANDS_CDN + f });
-        hands.setOptions({ maxNumHands:1, modelComplexity:0, minDetectionConfidence:0.5, minTrackingConfidence:0.5, selfieMode:false });
+        hands.setOptions({ maxNumHands:1, modelComplexity:1, minDetectionConfidence:0.3, minTrackingConfidence:0.4, selfieMode:false });
         hands.onResults(res => {
           const lm = stream && res.multiHandLandmarks?.[0];
-          handPoint = lm ? { nx: lm[8].x, ny: lm[8].y } : null;
+          if(!lm) { handPoint = null; return; }
+          const t = performance.now()/1000, b = cropBox;
+          handPoint = { nx: fx.filter(b.x0 + lm[8].x*b.w, t), ny: fy.filter(b.y0 + lm[8].y*b.h, t) };
         });
       }
-      const s = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1280}, height:{ideal:720}, facingMode:'user' } });
+      const s = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1920}, height:{ideal:1080}, facingMode:'user' } });
       if(!camWanted) { s.getTracks().forEach(t=>t.stop()); return; }
       stream = s;
       video.srcObject = s;
